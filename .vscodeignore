@@ -1,0 +1,10 @@
+# Environments
+.env
+.env.\*
+env/
+venv/
+\*.pem
+
+# python cache
+__pycache__/
+.pytest_cache/
