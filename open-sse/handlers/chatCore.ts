@@ -945,6 +945,14 @@ export async function handleChatCore({
   const requestedModel =
     typeof body?.model === "string" && body.model.trim().length > 0 ? body.model : model;
   const startTime = Date.now();
+  // Per-request trace id + checkpoint helper. Lets us see exactly which await
+  // a hung request was sitting on in `[STAGE_TRACE]` log lines.
+  const traceId = Math.random().toString(36).slice(2, 8);
+  const trace = (label: string, extra?: Record<string, unknown>) => {
+    const elapsed = Date.now() - startTime;
+    const suffix = extra ? ` ${JSON.stringify(extra)}` : "";
+    log?.info?.("STAGE_TRACE", `${traceId} ${label} t=${elapsed}ms${suffix}`);
+  };
   const persistFailureUsage = (statusCode: number, errorCode?: string | null) => {
     saveRequestUsage({
       provider: provider || "unknown",
@@ -1226,7 +1234,7 @@ export async function handleChatCore({
     const pipelinePayloads = detailedLoggingEnabled ? reqLogger?.getPipelinePayloads?.() : null;
 
     if (pipelinePayloads) {
-      if (providerResponse !== undefined) {
+      if (providerResponse !== undefined && !pipelinePayloads.providerResponse) {
         pipelinePayloads.providerResponse = providerResponse as Record<string, unknown>;
       }
       if (clientResponse !== undefined) {
@@ -1543,6 +1551,8 @@ export async function handleChatCore({
     }
   }
 
+  trace("post_injection", { provider, model });
+
   // Translate request (pass reqLogger for intermediate logging)
   // ── Proactive Context Compression (Phase 4) ──
   // Check if context exceeds 70% of limit and compress proactively before sending to provider.
@@ -1550,7 +1560,150 @@ export async function handleChatCore({
   const allMessages =
     body?.messages || body?.input || body?.contents || body?.request?.contents || [];
   if (body && Array.isArray(allMessages) && allMessages.length > 0) {
-    const estimatedTokens = estimateTokens(JSON.stringify(allMessages));
+    let estimatedTokens = estimateTokens(JSON.stringify(allMessages));
+
+    // --- Modular Compression Pipeline (Phase 1 Lite + Phase 2 Standard/Caveman + Phase 3 Aggressive) ---
+    // Runs BEFORE the existing reactive compressContext() to proactively reduce tokens.
+    try {
+      const { getCompressionSettings } = await import("../../src/lib/db/compression.ts");
+      const { selectCompressionStrategy, applyCompression } =
+        await import("../services/compression/strategySelector.ts");
+      const { trackCompressionStats } = await import("../services/compression/stats.ts");
+      let config = await getCompressionSettings();
+      let compressionComboKey = comboName ?? null;
+      if (isCombo && comboName) {
+        try {
+          const { getComboByName } = await import("../../src/lib/localDb");
+          let comboConfig = await getComboByName(comboName);
+          if (!comboConfig && comboName.startsWith("combo/")) {
+            comboConfig = await getComboByName(comboName.substring(6));
+          }
+          const comboRuntimeConfig =
+            comboConfig?.config && typeof comboConfig.config === "object"
+              ? (comboConfig.config as Record<string, unknown>)
+              : {};
+          const comboMode =
+            typeof comboRuntimeConfig.compressionMode === "string"
+              ? comboRuntimeConfig.compressionMode
+              : typeof comboConfig?.compressionOverride === "string"
+                ? comboConfig.compressionOverride
+                : null;
+          if (
+            comboMode === "off" ||
+            comboMode === "lite" ||
+            comboMode === "standard" ||
+            comboMode === "aggressive" ||
+            comboMode === "ultra"
+          ) {
+            config = {
+              ...config,
+              comboOverrides: {
+                ...(config.comboOverrides ?? {}),
+                ...(comboName ? { [comboName]: comboMode } : {}),
+                ...(comboConfig?.id ? { [comboConfig.id]: comboMode } : {}),
+              },
+            };
+            compressionComboKey = comboName;
+          }
+        } catch (err) {
+          log?.debug?.(
+            "COMPRESSION",
+            "Combo compression override lookup skipped: " +
+              (err instanceof Error ? err.message : String(err))
+          );
+        }
+      }
+      const compressionInputBody = body as Record<string, unknown>;
+      const mode = selectCompressionStrategy(
+        config,
+        compressionComboKey,
+        estimatedTokens,
+        compressionInputBody,
+        { provider, targetFormat, model: effectiveModel }
+      );
+      if (mode !== "off") {
+        const result = applyCompression(compressionInputBody, mode, {
+          model: effectiveModel,
+          config,
+        });
+        if (result.compressed && result.stats) {
+          body = result.body as typeof body;
+          estimatedTokens = result.stats.compressedTokens;
+          trackCompressionStats(result.stats);
+          void (async () => {
+            try {
+              const { insertCompressionAnalyticsRow } =
+                await import("../../src/lib/db/compressionAnalytics.ts");
+              insertCompressionAnalyticsRow({
+                timestamp: new Date().toISOString(),
+                combo_id: comboName ?? null,
+                provider: provider ?? null,
+                mode,
+                original_tokens: result.stats.originalTokens,
+                compressed_tokens: result.stats.compressedTokens,
+                tokens_saved: Math.max(
+                  0,
+                  result.stats.originalTokens - result.stats.compressedTokens
+                ),
+                duration_ms: result.stats.durationMs ?? null,
+                request_id: skillRequestId,
+              });
+            } catch (err) {
+              log?.debug?.(
+                "COMPRESSION",
+                "Compression analytics write skipped: " +
+                  (err instanceof Error ? err.message : String(err))
+              );
+            }
+          })();
+          void (async () => {
+            try {
+              const { detectCachingContext } =
+                await import("../services/compression/cachingAware.ts");
+              const { recordCacheStats } =
+                await import("../../src/lib/db/compressionCacheStats.ts");
+              const cacheContext = detectCachingContext(compressionInputBody, {
+                provider,
+                targetFormat,
+                model: effectiveModel,
+              });
+              const tokensSavedCompression = Math.max(
+                0,
+                result.stats.originalTokens - result.stats.compressedTokens
+              );
+              recordCacheStats({
+                provider: cacheContext.provider ?? provider ?? "unknown",
+                model: effectiveModel ?? "",
+                compressionMode: mode,
+                cacheControlPresent: cacheContext.hasCacheControl,
+                estimatedCacheHit: cacheContext.hasCacheControl && cacheContext.isCachingProvider,
+                tokensSavedCompression,
+                tokensSavedCaching: 0,
+                netSavings: tokensSavedCompression,
+              });
+            } catch (err) {
+              log?.debug?.(
+                "COMPRESSION",
+                "Compression cache stats write skipped: " +
+                  (err instanceof Error ? err.message : String(err))
+              );
+            }
+          })();
+          log?.info?.(
+            "COMPRESSION",
+            `Prompt compressed (${mode}): ${result.stats.originalTokens} -> ${result.stats.compressedTokens} tokens (${result.stats.savingsPercent}% saved, techniques: ${result.stats.techniquesUsed.join(",")})`
+          );
+        }
+      }
+    } catch (err) {
+      log?.warn?.(
+        "COMPRESSION",
+        "Compression pipeline error (non-fatal): " +
+          (err instanceof Error ? err.message : String(err))
+      );
+    }
+    // --- End Modular Compression Pipeline ---
+
     let contextLimit = getTokenLimit(provider, effectiveModel);
 
     if (isCombo && comboName) {
@@ -1696,7 +1849,36 @@ export async function handleChatCore({
   ) => {
     const preserveToolResultBlocks = options?.preserveToolResultBlocks === true;
     if (!Array.isArray(payload.messages)) return;
-    const messages = payload.messages as ClaudeMessage[];
+    let messages = payload.messages as ClaudeMessage[];
+
+    // Extract system role messages (Issue #1797)
+    const systemMessages = messages.filter((m) => m.role === "system");
+    if (systemMessages.length > 0) {
+      const extraBlocks: ClaudeContentBlock[] = [];
+      for (const sm of systemMessages) {
+        if (typeof sm.content === "string" && sm.content.length > 0) {
+          extraBlocks.push({ type: "text", text: sm.content });
+        } else if (Array.isArray(sm.content)) {
+          for (const block of sm.content as ClaudeContentBlock[]) {
+            if (block?.type === "text" && typeof block.text === "string" && block.text.length > 0) {
+              extraBlocks.push(block);
+            }
+          }
+        }
+      }
+      if (extraBlocks.length > 0) {
+        const existingSystem = payload.system;
+        if (typeof existingSystem === "string" && existingSystem.length > 0) {
+          payload.system = [{ type: "text", text: existingSystem }, ...extraBlocks];
+        } else if (Array.isArray(existingSystem)) {
+          payload.system = [...(existingSystem as ClaudeContentBlock[]), ...extraBlocks];
+        } else {
+          payload.system = extraBlocks;
+        }
+      }
+      messages = messages.filter((m) => m.role !== "system");
+      payload.messages = messages;
+    }
 
     // Anthropic rejects empty text blocks in native Messages payloads.
     for (const msg of messages) {
@@ -1947,6 +2129,8 @@ export async function handleChatCore({
     return createErrorResult(statusCode, message);
   }
 
+  trace("post_translation");
+
   // Extract toolNameMap for response translation (Claude OAuth)
   const translatedToolNameMap = translatedBody._toolNameMap;
   const nativeClaudeToolNameMap = isClaudePassthrough
@@ -1968,6 +2152,28 @@ export async function handleChatCore({
     finalModelToUpstream = finalModelToUpstream.slice(alias.length + 1);
   }
   translatedBody.model = finalModelToUpstream;
+
+  // #1789: Prevent output_config.effort from overriding effort encoded in model name (Codex)
+  if (provider === "codex" || provider?.startsWith("codex")) {
+    const hasEffortSuffix = finalModelToUpstream.match(/-(low|medium|high|xhigh)$/i);
+    if (
+      hasEffortSuffix &&
+      translatedBody.output_config &&
+      typeof translatedBody.output_config === "object"
+    ) {
+      const oc = translatedBody.output_config as Record<string, unknown>;
+      if (oc.effort) {
+        log?.warn?.(
+          "PARAMS",
+          `Stripped output_config.effort="${oc.effort}" because model "${finalModelToUpstream}" already encodes effort`
+        );
+        delete oc.effort;
+        if (Object.keys(oc).length === 0) {
+          delete translatedBody.output_config;
+        }
+      }
+    }
+  }
 
   // Strip unsupported parameters for reasoning models (o1, o3, etc.)
   const unsupported = getUnsupportedParams(provider, model);
@@ -2081,7 +2287,13 @@ export async function handleChatCore({
   };
 
   // Create stream controller for disconnect detection
-  const streamController = createStreamController({ onDisconnect, log, provider, model });
+  const streamController = createStreamController({
+    onDisconnect,
+    log,
+    provider,
+    model,
+    connectionId,
+  });
 
   const dedupRequestBody = { ...translatedBody, model: `${provider}/${model}`, stream };
   const dedupEnabled = shouldDeduplicate(dedupRequestBody);
@@ -2165,6 +2377,10 @@ export async function handleChatCore({
         }
       }
 
+      trace("pre_semaphore", {
+        semaphoreKey: accountSemaphoreKey,
+        max: accountSemaphoreMaxConcurrency,
+      });
       const acquireAccountSemaphoreRelease =
         accountSemaphoreKey && accountSemaphoreMaxConcurrency != null
           ? await acquireAccountSemaphore(accountSemaphoreKey, {
@@ -2172,17 +2388,21 @@ export async function handleChatCore({
               signal: streamController.signal,
             })
           : () => {};
+      trace("post_semaphore");
 
       try {
+        trace("pre_rate_limit");
         const rawResult = await withRateLimit(
           provider,
           connectionId,
           modelToCall,
           async () => {
+            trace("inside_rate_limit");
             let attempts = 0;
             const maxAttempts = provider === "qwen" ? 3 : 1;
 
             while (attempts < maxAttempts) {
+              trace("pre_executor", { attempt: attempts });
               const res = await executor.execute({
                 model: modelToCall,
                 body: bodyToSend,
@@ -2195,6 +2415,7 @@ export async function handleChatCore({
                 clientHeaders: buildExecutorClientHeaders(clientRawRequest?.headers, userAgent),
                 onCredentialsRefreshed,
               });
+              trace("post_executor", { status: res?.response?.status });
 
               // Qwen 429 strict quota backoff (wait 1.5s, 3s and retry)
               if (

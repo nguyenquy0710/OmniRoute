@@ -481,7 +481,13 @@ function stripStoredItemReferences(body: Record<string, unknown>): void {
   // Codex rejects previous_response_id for passthrough requests.
   delete body.previous_response_id;
   if (Array.isArray(body.input) && body.input.length === 0) {
-    delete body.input;
+    body.input = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "continue" }],
+      },
+    ];
   }
 
   if (!Array.isArray(body.input)) return;
@@ -619,10 +625,27 @@ function normalizeCodexTools(body: Record<string, unknown>): void {
 }
 
 function getResponsesSubpath(endpointPath: unknown): string | null {
-  const normalizedEndpoint = String(endpointPath || "").replace(/\/+$/, "");
-  const match = normalizedEndpoint.match(/(?:^|\/)responses(?:(\/.*))?$/i);
-  if (!match) return null;
-  return match[1] || "";
+  let normalizedEndpoint = String(endpointPath || "");
+  while (normalizedEndpoint.endsWith("/") && normalizedEndpoint.length > 0) {
+    normalizedEndpoint = normalizedEndpoint.slice(0, -1);
+  }
+
+  const lower = normalizedEndpoint.toLowerCase();
+  if (lower === "responses" || lower.endsWith("/responses")) {
+    return "";
+  }
+
+  const responsesSlash = "/responses/";
+  const idx = lower.lastIndexOf(responsesSlash);
+  if (idx !== -1) {
+    return normalizedEndpoint.slice(idx + "/responses".length);
+  }
+
+  if (lower.startsWith("responses/")) {
+    return normalizedEndpoint.slice("responses".length);
+  }
+
+  return null;
 }
 
 export function isCompactResponsesEndpoint(endpointPath: unknown): boolean {
@@ -1146,6 +1169,7 @@ export class CodexExecutor extends BaseExecutor {
     if (isCompactRequest) {
       delete body.stream;
       delete body.stream_options;
+      delete body.client_metadata;
     } else {
       body.stream = true;
     }
@@ -1227,6 +1251,23 @@ export class CodexExecutor extends BaseExecutor {
     // so any references to previous response items would cause 404 errors.
     stripStoredItemReferences(body);
 
+    // Issue #1832: Map messages to input for clients like Cursor 5.5 that use responses/compact but send messages instead of input
+    if (!body.input && Array.isArray(body.messages)) {
+      body.input = body.messages.map((msg: any) => ({
+        type: "message",
+        role: typeof msg.role === "string" ? msg.role : "user",
+        content:
+          typeof msg.content === "string"
+            ? [{ type: "input_text", text: msg.content }]
+            : Array.isArray(msg.content)
+              ? msg.content.map((c: any) => {
+                  if (c && c.type === "text") return { type: "input_text", text: c.text };
+                  return c;
+                })
+              : [],
+      }));
+    }
+
     // Issue #806: Even for native passthrough, some clients (purist completions) might indiscriminately inject
     // a `messages` or `prompt` array which the strict Codex Responses schema rejects.
     delete body.messages;
@@ -1288,7 +1329,9 @@ export class CodexExecutor extends BaseExecutor {
         body.prompt_cache_key = cacheSessionId;
       }
     }
-    applyCodexClientMetadata(body, credentials?.providerSpecificData?.codexClientIdentity);
+    if (!isCompactRequest) {
+      applyCodexClientMetadata(body, credentials?.providerSpecificData?.codexClientIdentity);
+    }
 
     // Delete session_id and conversation_id from the body.
     // These are often injected by OmniRoute's fallback logic for store=true,
