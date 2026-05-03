@@ -12,6 +12,7 @@ with **MCP Server** (29 tools), **A2A v0.3 Protocol**, and **Electron desktop ap
 
 - **Runtime**: Next.js 16 (App Router), Node.js `>=20.20.2 <21`, `>=22.22.2 <23`, or `>=24.0.0 <25`, ES Modules (`"type": "module"`)
 - **Language**: TypeScript 5.9 (`src/`) + JavaScript (`open-sse/`, `electron/`)
+- **Workspace**: Monorepo with `open-sse/` package
 - **Database**: better-sqlite3 (SQLite) — `DATA_DIR` configurable, default `~/.omniroute/`
 - **Streaming**: SSE via `open-sse` internal workspace package
 - **Styling**: Tailwind CSS v4
