@@ -1,5 +1,6 @@
 import { HTTP_STATUS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { applyFingerprint, isCliCompatEnabled } from "../config/cliFingerprints.ts";
+import { supportsXHighEffort } from "../config/providerModels.ts";
 import { getRotatingApiKey } from "../services/apiKeyRotator.ts";
 import { getOpenAICompatibleType, isClaudeCodeCompatible } from "../services/provider.ts";
 import type { ProviderRequestDefaults } from "../services/providerRequestDefaults.ts";
@@ -12,6 +13,12 @@ import {
 import { getClaudeCodeCompatibleRequestDefaults } from "@/lib/providers/requestDefaults";
 import { remapToolNamesInRequest } from "../services/claudeCodeToolRemapper.ts";
 import { obfuscateInBody } from "../services/claudeCodeObfuscation.ts";
+import { applySystemTransformPipeline, PROVIDER_CLAUDE } from "../services/systemTransforms.ts";
+import {
+  fixToolPairs,
+  fixToolAdjacency,
+  stripTrailingAssistantOrphanToolUse,
+} from "../services/contextManager.ts";
 import { randomUUID } from "node:crypto";
 import {
   CLAUDE_CODE_VERSION,
@@ -68,6 +75,7 @@ export type ProviderCredentials = {
   accessToken?: string;
   refreshToken?: string;
   apiKey?: string;
+  projectId?: string | null;
   expiresAt?: string;
   connectionId?: string; // T07: used for API key rotation index
   maxConcurrent?: number | null;
@@ -169,6 +177,77 @@ export function mergeAbortSignals(primary: AbortSignal, secondary: AbortSignal):
   primary.addEventListener("abort", () => abortFrom(primary), { once: true });
   secondary.addEventListener("abort", () => abortFrom(secondary), { once: true });
   return controller.signal;
+}
+
+/**
+ * Sanitize reasoning_effort for providers that don't accept all values.
+ *
+ * The claude→openai translator emits reasoning_effort=xhigh when the client
+ * sends output_config.effort=max on a Claude-shape request. Combined with
+ * runtime alias remapping (e.g. claude-opus-4-6 → mimo/mimo-v2.5-pro), this
+ * routes xhigh to OpenAI-shape providers that don't accept the value:
+ *
+ *   xiaomi-mimo : low|medium|high only — 400 literal_error on xhigh
+ *   mistral     : devstral models reject reasoning_effort entirely
+ *   github      : claude/haiku/oswe models reject reasoning_effort entirely
+ *
+ * Each rejection burns a combo fallback attempt before reaching a working
+ * provider. Apply provider-aware sanitation here (after transformRequest, so
+ * reintroductions by per-provider transforms are also caught) before fetch.
+ * Models that genuinely support xhigh (registry flag supportsXHighEffort)
+ * pass through unchanged.
+ */
+const MISTRAL_NO_REASONING_EFFORT_PATTERN = /devstral/i;
+const GITHUB_NO_REASONING_EFFORT_PATTERN = /(claude|haiku|oswe)/i;
+export function sanitizeReasoningEffortForProvider(
+  body: unknown,
+  provider: string,
+  model: string | undefined,
+  log?: { info?: (tag: string, msg: string) => void } | null
+): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const b = body as Record<string, unknown>;
+  const reasoning =
+    b.reasoning && typeof b.reasoning === "object" && !Array.isArray(b.reasoning)
+      ? (b.reasoning as Record<string, unknown>)
+      : null;
+  const effort = b.reasoning_effort ?? reasoning?.effort;
+  if (effort === undefined) return body;
+  const effortStr = typeof effort === "string" ? effort.toLowerCase() : "";
+  const modelStr = model || "";
+
+  if (effortStr === "xhigh" && !supportsXHighEffort(provider, modelStr)) {
+    log?.info?.(
+      "REASONING_SANITIZE",
+      `${provider}/${modelStr}: downgraded reasoning_effort xhigh → high`
+    );
+    const next: Record<string, unknown> = { ...b, reasoning_effort: "high" };
+    if (reasoning) {
+      next.reasoning = { ...reasoning, effort: "high" };
+    }
+    return next;
+  }
+
+  const rejecting =
+    (provider === "mistral" && MISTRAL_NO_REASONING_EFFORT_PATTERN.test(modelStr)) ||
+    (provider === "github" && GITHUB_NO_REASONING_EFFORT_PATTERN.test(modelStr));
+  if (rejecting) {
+    log?.info?.(
+      "REASONING_SANITIZE",
+      `${provider}/${modelStr}: removed unsupported reasoning_effort`
+    );
+    const next: Record<string, unknown> = { ...b };
+    delete next.reasoning_effort;
+    if (reasoning) {
+      const r = { ...reasoning };
+      delete r.effort;
+      if (Object.keys(r).length === 0) delete next.reasoning;
+      else next.reasoning = r;
+    }
+    return next;
+  }
+
+  return body;
 }
 
 /**
@@ -484,7 +563,18 @@ export class BaseExecutor {
         appendAnthropicBetaHeader(headers, CONTEXT_1M_BETA_HEADER);
       }
 
-      const transformedBody = await this.transformRequest(model, body, stream, activeCredentials);
+      const rawTransformedBody = await this.transformRequest(
+        model,
+        body,
+        stream,
+        activeCredentials
+      );
+      const transformedBody = sanitizeReasoningEffortForProvider(
+        rawTransformedBody,
+        this.provider,
+        model,
+        log
+      );
 
       try {
         // Only enforce the timeout while waiting for the initial fetch() response.
@@ -534,6 +624,15 @@ export class BaseExecutor {
           stripProxyToolPrefix(tb);
           remapToolNamesInRequest(tb);
           obfuscateInBody(tb);
+
+          // NOTE (issue #2260): This is the native `claude` provider OAuth path.
+          // It is intentionally NOT routed through applyCcBridgeTransformPipeline.
+          // The native OAuth path already prepends its own billing line + sentinel
+          // (see lines ~744-773 below, dayStamp-based, cc_entrypoint=cli, cch=00000
+          // placeholder, signed at body level). The CC bridge transforms DSL is
+          // wired into buildAndSignClaudeCodeRequest (claudeCodeCompatible.ts step 5b)
+          // which is the anthropic-compatible-cc-* relay path — a different,
+          // separately classified surface. Do not double-prepend here.
 
           // Real CLI never sets cache_control on tools.
           if (Array.isArray(tb.tools)) {
@@ -688,6 +787,22 @@ export class BaseExecutor {
           sysBlocks.unshift({ type: "text", text: billingLine }, { type: "text", text: SENTINEL });
           tb.system = sysBlocks;
 
+          // Run the configurable system-transforms pipeline for the native
+          // `claude` provider (issue #2260 / comment 4459544580). The default
+          // claude pipeline runs cosmetic ops only (Open WebUI paragraph
+          // anchors, identity-prefix paragraph drop, ZWJ obfuscation of
+          // sensitive words). It deliberately does NOT include
+          // `inject_billing_header` — billing + sentinel are already
+          // prepended above. Users can extend the pipeline via Settings UI.
+          {
+            const transformResult = applySystemTransformPipeline(PROVIDER_CLAUDE, tb);
+            if (transformResult.appliedOpKinds.length > 0) {
+              console.log(
+                `[SystemTransforms] claude-native: ${transformResult.appliedOpKinds.join(", ")}`
+              );
+            }
+          }
+
           if (!tb.metadata || typeof tb.metadata !== "object") tb.metadata = {};
           (tb.metadata as Record<string, unknown>).user_id = buildUserIdJson({
             deviceId,
@@ -746,6 +861,32 @@ export class BaseExecutor {
         // CLI fingerprint ordering — always-on for native Claude OAuth, opt-in
         // for other providers. Header + body field order is itself a fingerprint.
         let finalHeaders = headers;
+        // Strip internal sentinel fields set by remapToolNamesInRequest before
+        // serializing — Anthropic rejects unknown top-level fields (issue #2260).
+        delete (transformedBody as Record<string, unknown>)[
+          "_claudeCodeRequiresLowercaseToolNames"
+        ];
+        // Guard against orphan tool_use / tool_result pairs. Clients can ship
+        // truncated histories mid-tool-call which Anthropic rejects with
+        // `messages.N: tool_use ids were found without tool_result blocks
+        // immediately after: toolu_...`. fixToolPairs strips orphans, then
+        // stripTrailingAssistantOrphanToolUse catches the case where the
+        // request body itself ends on an unmatched assistant(tool_use) —
+        // invalid for an upstream-send turn since the body must end on a
+        // user message. Both are idempotent on clean histories.
+        {
+          const tb = transformedBody as Record<string, unknown>;
+          if (Array.isArray(tb?.messages)) {
+            const fixed = fixToolPairs(tb.messages as Record<string, unknown>[]);
+            // fixToolAdjacency enforces Claude's strict adjacency rule
+            // (tool_result must be in immediately next message).
+            // Only apply for Claude/Claude-compatible — OpenAI allows results
+            // spread across multiple subsequent messages.
+            const isClaude = this.provider === "claude" || isClaudeCodeCompatible(this.provider);
+            const adjacent = isClaude ? fixToolAdjacency(fixed) : fixed;
+            tb.messages = stripTrailingAssistantOrphanToolUse(adjacent);
+          }
+        }
         let bodyString = JSON.stringify(transformedBody);
 
         const shouldFingerprint =

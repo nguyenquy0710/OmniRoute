@@ -65,6 +65,7 @@ export {
   getAllSyncedAvailableModels,
   replaceSyncedAvailableModelsForConnection,
   deleteSyncedAvailableModelsForConnection,
+  deleteSyncedAvailableModelsForProvider,
 } from "./db/models";
 
 export type { ModelCompatPerProtocol, ModelCompatPatch, SyncedAvailableModel } from "./db/models";
@@ -260,6 +261,8 @@ export {
   countBatches,
   getPendingBatches,
   getTerminalBatches,
+  deleteBatch,
+  deleteCompletedBatches,
 } from "./db/batches";
 
 export type { FileRecord } from "./db/files";
@@ -372,3 +375,13 @@ export {
 } from "./db/oneproxy";
 
 export type { OneproxyProxyRecord, OneproxyStats } from "./db/oneproxy";
+
+export {
+  getSessionAccountAffinity,
+  upsertSessionAccountAffinity,
+  touchSessionAccountAffinity,
+  deleteSessionAccountAffinity,
+  cleanupStaleSessionAccountAffinities,
+  startSessionAccountAffinityCleanup,
+  stopSessionAccountAffinityCleanupForTests,
+} from "./db/sessionAccountAffinity";
